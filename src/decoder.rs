@@ -3,8 +3,8 @@ use crate::huffman::{fill_default_mjpeg_tables, HuffmanDecoder, HuffmanTable};
 use crate::marker::Marker;
 use crate::parser::{
     parse_app, parse_com, parse_dht, parse_dqt, parse_dri, parse_sof, parse_sos,
-    AdobeColorTransform, AppData, CodingProcess, Component, Dimensions, EntropyCoding, FrameInfo,
-    IccChunk, ScanInfo,
+    AdobeColorTransform, AppData, CodingProcess, Component, Density, Dimensions, EntropyCoding,
+    FrameInfo, IccChunk, JfifApp0, ScanInfo,
 };
 use crate::read_u8;
 use crate::upsampler::Upsampler;
@@ -72,6 +72,8 @@ pub struct ImageInfo {
     pub pixel_format: PixelFormat,
     /// The coding process of the image.
     pub coding_process: CodingProcess,
+    /// The density of the image, if available
+    pub density: Option<Density>,
 }
 
 /// JPEG decoder
@@ -85,6 +87,7 @@ pub struct Decoder<R> {
 
     restart_interval: u16,
     color_transform: Option<AdobeColorTransform>,
+    jfif_app0: Option<JfifApp0>,
     is_jfif: bool,
     is_mjpeg: bool,
 
@@ -112,6 +115,7 @@ impl<R: Read> Decoder<R> {
             quantization_tables: [None, None, None, None],
             restart_interval: 0,
             color_transform: None,
+            jfif_app0: None,
             is_jfif: false,
             is_mjpeg: false,
             icc_markers: Vec::new(),
@@ -145,11 +149,14 @@ impl<R: Read> Decoder<R> {
                     _ => panic!(),
                 };
 
+                let density = self.jfif_app0.as_ref().map(|j| j.density.clone());
+
                 Some(ImageInfo {
                     width: frame.output_size.width,
                     height: frame.output_size.height,
                     pixel_format,
                     coding_process: frame.coding_process,
+                    density,
                 })
             }
             None => None,
@@ -211,7 +218,7 @@ impl<R: Read> Decoder<R> {
                 } else {
                     PreferWorkerKind::Immediate
                 }
-            },
+            }
         }
     }
 
@@ -219,10 +226,7 @@ impl<R: Read> Decoder<R> {
     ///
     /// If successful, the metadata can be obtained using the `info` method.
     pub fn read_info(&mut self) -> Result<()> {
-        WorkerScope::with(|worker| {
-            self.decode_internal(true, worker)
-        })
-        .map(|_| ())
+        WorkerScope::with(|worker| self.decode_internal(true, worker)).map(|_| ())
     }
 
     /// Configure the decoder to scale the image during decoding.
@@ -250,9 +254,7 @@ impl<R: Read> Decoder<R> {
 
     /// Decodes the image and returns the decoded pixels if successful.
     pub fn decode(&mut self) -> Result<Vec<u8>> {
-        WorkerScope::with(|worker| {
-            self.decode_internal(false, worker)
-        })
+        WorkerScope::with(|worker| self.decode_internal(false, worker))
     }
 
     fn decode_internal(
@@ -415,11 +417,13 @@ impl<R: Read> Decoder<R> {
                             }
                         }
 
-                        let preference = Self::select_worker(&frame, PreferWorkerKind::Multithreaded);
+                        let preference =
+                            Self::select_worker(&frame, PreferWorkerKind::Multithreaded);
 
-                        let (marker, data) = worker_scope.get_or_init_worker(
-                            preference,
-                            |worker| self.decode_scan(&frame, &scan, worker, &finished))?;
+                        let (marker, data) = worker_scope
+                            .get_or_init_worker(preference, |worker| {
+                                self.decode_scan(&frame, &scan, worker, &finished)
+                            })?;
 
                         if let Some(data) = data {
                             for (i, plane) in data
@@ -494,7 +498,7 @@ impl<R: Read> Decoder<R> {
                             AppData::Adobe(color_transform) => {
                                 self.color_transform = Some(color_transform)
                             }
-                            AppData::Jfif => {
+                            AppData::Jfif(jfif) => {
                                 // From the JFIF spec:
                                 // "The APP0 marker is used to identify a JPEG FIF file.
                                 //     The JPEG FIF APP0 marker is mandatory right after the SOI marker."
@@ -506,7 +510,8 @@ impl<R: Read> Decoder<R> {
                                 }
                                 */
 
-                                self.is_jfif = true;
+                                self.jfif_app0 = Some(jfif);
+                                self.is_jfif = self.jfif_app0.is_some();
                             }
                             AppData::Avi1 => self.is_mjpeg = true,
                             AppData::Icc(icc) => self.icc_markers.push(icc),
@@ -566,10 +571,9 @@ impl<R: Read> Decoder<R> {
         let frame = self.frame.as_ref().unwrap();
         let preference = Self::select_worker(&frame, PreferWorkerKind::Multithreaded);
 
-        worker_scope.get_or_init_worker(
-            preference,
-            |worker| self.decode_planes(worker, planes, planes_u16)
-        )
+        worker_scope.get_or_init_worker(preference, |worker| {
+            self.decode_planes(worker, planes, planes_u16)
+        })
     }
 
     fn decode_planes(
